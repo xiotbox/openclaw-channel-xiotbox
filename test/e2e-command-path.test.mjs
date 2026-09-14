@@ -78,6 +78,10 @@ function channelDecryptMeta(deviceId, threadId, commandId, extra = {}) {
     command_id: commandId,
     content_type: 'text/markdown',
     chunk_seq: 0,
+    // Production channel.ts always derives enc_v from the envelope
+    // (encryptText emits enc_version=2); the meta must match or the strict
+    // v2 AAD verification (XIOT-BUG-0118) rejects the frame.
+    enc_v: 2,
     ...extra,
   };
 }
@@ -235,4 +239,58 @@ test('without packetAAD the local meta binding is enforced: wrong command_id fai
       channelDecryptMeta(deviceId, 'conv-other', 'cmd-meta-1', { enc_v: 2 }),
     ),
   );
+});
+
+test('permission_preset binding survives enc_version downgrade, omission and corruption', () => {
+  const deviceId = 'dev-preset-downgrade';
+  const bot = makeBot(deviceId);
+  const hello = bot.helloPayload();
+  const client = makeClient(deviceId);
+  const base = channelDecryptMeta(deviceId, 'conv-preset', 'cmd-preset');
+
+  const cases = [
+    {
+      name: 'replace',
+      sentMeta: { ...base, permission_preset: 'auto-approve' },
+      recvMeta: { ...base, permission_preset: 'danger-full-access' },
+    },
+    {
+      name: 'delete',
+      sentMeta: { ...base, permission_preset: 'auto-approve' },
+      recvMeta: { ...base },
+    },
+    {
+      name: 'inject',
+      sentMeta: { ...base },
+      recvMeta: { ...base, permission_preset: 'auto-approve' },
+    },
+  ];
+
+  for (const scenario of cases) {
+    const envelope = client.encryptText(
+      `preset-${scenario.name}`,
+      scenario.sentMeta,
+      { publicKey: hello.pubkey, keyId: hello.key_id },
+    );
+
+    for (const versionMode of ['downgrade', 'missing', 'malformed']) {
+      const tampered = { ...envelope };
+      if (versionMode === 'downgrade') tampered.enc_version = 1;
+      else if (versionMode === 'missing') delete tampered.enc_version;
+      else tampered.enc_version = 'not-a-version';
+
+      const recvMeta = {
+        ...scenario.recvMeta,
+        // This mirrors channel.ts: a tampered/missing envelope version can
+        // influence locally reconstructed metadata, but must never relax
+        // authenticated preset semantics.
+        enc_v: versionMode === 'downgrade' ? 1 : undefined,
+      };
+      assert.throws(
+        () => bot.decryptText(tampered, recvMeta),
+        undefined,
+        `${scenario.name}/${versionMode} must fail closed`,
+      );
+    }
+  }
 });
