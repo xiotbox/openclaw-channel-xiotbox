@@ -240,3 +240,57 @@ test('without packetAAD the local meta binding is enforced: wrong command_id fai
     ),
   );
 });
+
+test('permission_preset binding survives enc_version downgrade, omission and corruption', () => {
+  const deviceId = 'dev-preset-downgrade';
+  const bot = makeBot(deviceId);
+  const hello = bot.helloPayload();
+  const client = makeClient(deviceId);
+  const base = channelDecryptMeta(deviceId, 'conv-preset', 'cmd-preset');
+
+  const cases = [
+    {
+      name: 'replace',
+      sentMeta: { ...base, permission_preset: 'auto-approve' },
+      recvMeta: { ...base, permission_preset: 'danger-full-access' },
+    },
+    {
+      name: 'delete',
+      sentMeta: { ...base, permission_preset: 'auto-approve' },
+      recvMeta: { ...base },
+    },
+    {
+      name: 'inject',
+      sentMeta: { ...base },
+      recvMeta: { ...base, permission_preset: 'auto-approve' },
+    },
+  ];
+
+  for (const scenario of cases) {
+    const envelope = client.encryptText(
+      `preset-${scenario.name}`,
+      scenario.sentMeta,
+      { publicKey: hello.pubkey, keyId: hello.key_id },
+    );
+
+    for (const versionMode of ['downgrade', 'missing', 'malformed']) {
+      const tampered = { ...envelope };
+      if (versionMode === 'downgrade') tampered.enc_version = 1;
+      else if (versionMode === 'missing') delete tampered.enc_version;
+      else tampered.enc_version = 'not-a-version';
+
+      const recvMeta = {
+        ...scenario.recvMeta,
+        // This mirrors channel.ts: a tampered/missing envelope version can
+        // influence locally reconstructed metadata, but must never relax
+        // authenticated preset semantics.
+        enc_v: versionMode === 'downgrade' ? 1 : undefined,
+      };
+      assert.throws(
+        () => bot.decryptText(tampered, recvMeta),
+        undefined,
+        `${scenario.name}/${versionMode} must fail closed`,
+      );
+    }
+  }
+});

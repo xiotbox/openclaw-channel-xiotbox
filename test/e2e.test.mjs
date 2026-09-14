@@ -405,7 +405,8 @@ test('a preset sealed into the AAD cannot be tampered, deleted or injected in fl
     chunk_seq: 0,
   };
   const boundAad = e2e.buildAad({ ...base, permission_preset: 'auto-approve' });
-  // enc_version=2 selects the strict canonical AAD verification.
+  // v2 strictness is derived from the authenticated AAD grammar, not from
+  // the unauthenticated envelope.enc_version selector.
   const envelope = buildEnvelope(Buffer.from('secret'), pub, 'k', boundAad, 's', 2);
   // Legitimate: the same preset-bound AAD verifies.
   assert.equal(decryptEnvelope(envelope, priv, boundAad).toString('utf-8'), 'secret');
@@ -424,4 +425,35 @@ test('a preset sealed into the AAD cannot be tampered, deleted or injected in fl
   );
   // Legacy traffic stays compatible.
   assert.equal(decryptEnvelope(legacyEnvelope, priv, e2e.buildAad(base)).toString('utf-8'), 'secret');
+});
+
+test('strict AAD verification cannot be downgraded by enc_version tampering', () => {
+  const e2e = new OpenClawE2E({});
+  const { priv, pub } = x25519Keypair();
+  const base = {
+    direction: 'in',
+    device_id: 'dev-downgrade',
+    thread_id: 'main',
+    command_id: 'cmd-downgrade',
+    content_type: 'text',
+    chunk_seq: 0,
+    enc_v: 2,
+  };
+  const boundAad = e2e.buildAad({ ...base, permission_preset: 'auto-approve' });
+  const envelope = buildEnvelope(Buffer.from('secret'), pub, 'k', boundAad, 's', 2);
+  const mismatchedLocalAad = e2e.buildAad({
+    ...base,
+    enc_v: 1,
+    permission_preset: 'danger-full-access',
+  });
+
+  for (const tamperedVersion of [1, undefined, 'not-a-version']) {
+    const tampered = { ...envelope };
+    if (tamperedVersion === undefined) delete tampered.enc_version;
+    else tampered.enc_version = tamperedVersion;
+    assert.throws(
+      () => decryptEnvelope(tampered, priv, mismatchedLocalAad),
+      /e2e_aad_mismatch/,
+    );
+  }
 });
