@@ -186,9 +186,17 @@ export function decryptEnvelope(
   const envAad = envelope.aad_b64 ? b64d(envelope.aad_b64) : null;
 
   // Prioritize envelope AAD (packetAAD) over provided AAD (localAAD)
-  // This fixes multi-device scenarios where device_id differs
+  // This fixes multi-device scenarios where device_id differs.
+  // XIOT-BUG-0118: for the canonical v2 grammar a mismatch between the
+  // caller-derived AAD (from THIS dispatch frame) and the envelope-carried
+  // AAD is a protocol violation — the carried value must never override
+  // canonical verification, otherwise the authenticated dispatch context
+  // (including permission_preset) is tamperable. Legacy envelopes
+  // (enc_version < 2) keep the lenient fallback.
   if (aad && envAad && !aad.equals(envAad)) {
-    // Log warning but don't throw - use envelope AAD
+    if ((envelope.enc_version ?? 1) >= 2) {
+      throw new Error('e2e_aad_mismatch');
+    }
     console.warn('[E2E] AAD mismatch, using envelope AAD', {
       providedHash: aad.toString('hex').slice(0, 24),
       envelopeHash: envAad.toString('hex').slice(0, 24),
@@ -795,6 +803,15 @@ export class OpenClawE2E {
     content_type: string;
     chunk_seq?: number;
     enc_v?: number;
+    /**
+     * Optional trailing `|preset=<value>` AAD segment (XIOT-BUG-0118): bound
+     * IFF the dispatch carries a non-empty permission_preset. Absent/empty
+     * is canonical for "no preset" and yields byte-identical legacy AAD; an
+     * empty segment is never serialized. Receivers derive it from THIS
+     * dispatch frame's payload field, so a preset replaced, deleted or
+     * added in flight fails AAD verification with its ciphertext.
+     */
+    permission_preset?: string | null;
   }): Buffer {
     const encV = meta.enc_v || this.encV || E2E_VERSION;
     const parts = [
@@ -806,6 +823,8 @@ export class OpenClawE2E {
       `type=${meta.content_type || ''}`,
       `seq=${meta.chunk_seq || 0}`,
     ];
+    const preset = String(meta.permission_preset ?? '').trim();
+    if (preset) parts.push(`preset=${preset}`);
     return Buffer.from(`oc|${parts.join('|')}`, 'utf-8');
   }
 
@@ -986,21 +1005,32 @@ export class OpenClawE2E {
     // Read enc_version for controlled fallback
     const encVersion = envelope.enc_version ?? 1;
 
-    // Priority 1: Try with packetAAD (envelope.aad_b64)
+    // Priority 1: canonical AAD derived from THIS frame's metadata (never
+    // the envelope-carried AAD — since XIOT-BUG-0118 decryptEnvelope rejects
+    // a v2 mismatch, trusting packetAAD here would bypass canonical
+    // verification of the authenticated dispatch context).
+    const localAad = this.buildAad(meta);
+    try {
+      const raw = decryptEnvelope(envelope, this.privRaw, localAad);
+      return raw.toString('utf-8');
+    } catch (err) {
+      console.warn('[E2E] Decrypt with canonical localAAD failed, trying packetAAD', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Priority 2: packetAAD (envelope.aad_b64) — legacy envelopes only.
     const envAad = envelope.aad_b64 ? b64d(envelope.aad_b64) : null;
-    if (envAad) {
+    if (envAad && (envelope.enc_version ?? 1) < 2) {
       try {
         const raw = decryptEnvelope(envelope, this.privRaw, envAad);
         return raw.toString('utf-8');
       } catch (err) {
-        console.warn('[E2E] Decrypt with packetAAD failed, trying localAAD', {
+        console.warn('[E2E] Decrypt with packetAAD failed', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
     }
-
-    // Priority 2: Fallback to localAAD (canonical)
-    const localAad = this.buildAad(meta);
     try {
       const raw = decryptEnvelope(envelope, this.privRaw, localAad);
       return raw.toString('utf-8');

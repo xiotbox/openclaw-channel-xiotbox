@@ -367,3 +367,61 @@ test('trust pinning re-enrolls an additional identity when enrollment is allowed
   assert.ok(second, 'additional identity is enrolled when allowed');
   assert.equal(e2e.peerTrustError, '');
 });
+
+// ── XIOT-BUG-0118: optional |preset=<value> AAD segment ──
+
+test('buildAad appends the preset segment only for a non-empty permission_preset', () => {
+  const e2e = new OpenClawE2E({});
+  const base = {
+    direction: 'in',
+    device_id: 'dev-1',
+    thread_id: 'main',
+    command_id: 'cmd-1',
+    content_type: 'text',
+    chunk_seq: 0,
+  };
+  assert.equal(
+    e2e.buildAad({ ...base, permission_preset: 'auto-approve' }).toString('utf-8'),
+    'oc|v=1|dir=in|device=dev-1|thread=main|cmd=cmd-1|type=text|seq=0|preset=auto-approve',
+  );
+  // Absent, null, empty and whitespace-only are canonical "no preset":
+  // byte-identical to the legacy AAD, never an empty segment.
+  const legacy = e2e.buildAad(base).toString('utf-8');
+  assert.equal(e2e.buildAad({ ...base, permission_preset: undefined }).toString('utf-8'), legacy);
+  assert.equal(e2e.buildAad({ ...base, permission_preset: null }).toString('utf-8'), legacy);
+  assert.equal(e2e.buildAad({ ...base, permission_preset: '' }).toString('utf-8'), legacy);
+  assert.equal(e2e.buildAad({ ...base, permission_preset: '   ' }).toString('utf-8'), legacy);
+});
+
+test('a preset sealed into the AAD cannot be tampered, deleted or injected in flight', () => {
+  const e2e = new OpenClawE2E({});
+  const { priv, pub } = x25519Keypair();
+  const base = {
+    direction: 'in',
+    device_id: 'dev-1',
+    thread_id: 'main',
+    command_id: 'cmd-preset',
+    content_type: 'text',
+    chunk_seq: 0,
+  };
+  const boundAad = e2e.buildAad({ ...base, permission_preset: 'auto-approve' });
+  // enc_version=2 selects the strict canonical AAD verification.
+  const envelope = buildEnvelope(Buffer.from('secret'), pub, 'k', boundAad, 's', 2);
+  // Legitimate: the same preset-bound AAD verifies.
+  assert.equal(decryptEnvelope(envelope, priv, boundAad).toString('utf-8'), 'secret');
+  // Replaced preset in flight: mismatch.
+  assert.throws(() =>
+    decryptEnvelope(envelope, priv, e2e.buildAad({ ...base, permission_preset: 'danger-full-access' })),
+  );
+  // Deleted preset in flight: the legacy AAD cannot verify preset-bound ciphertext.
+  assert.throws(() => decryptEnvelope(envelope, priv, e2e.buildAad(base)));
+
+  // Injected preset on a legacy frame: the preset-bound AAD cannot verify
+  // ciphertext sealed under the legacy AAD.
+  const legacyEnvelope = buildEnvelope(Buffer.from('secret'), pub, 'k', e2e.buildAad(base), 's', 2);
+  assert.throws(() =>
+    decryptEnvelope(legacyEnvelope, priv, e2e.buildAad({ ...base, permission_preset: 'auto-approve' })),
+  );
+  // Legacy traffic stays compatible.
+  assert.equal(decryptEnvelope(legacyEnvelope, priv, e2e.buildAad(base)).toString('utf-8'), 'secret');
+});

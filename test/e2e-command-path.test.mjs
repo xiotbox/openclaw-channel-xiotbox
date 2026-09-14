@@ -78,6 +78,10 @@ function channelDecryptMeta(deviceId, threadId, commandId, extra = {}) {
     command_id: commandId,
     content_type: 'text/markdown',
     chunk_seq: 0,
+    // Production channel.ts always derives enc_v from the envelope
+    // (encryptText emits enc_version=2); the meta must match or the strict
+    // v2 AAD verification (XIOT-BUG-0118) rejects the frame.
+    enc_v: 2,
     ...extra,
   };
 }

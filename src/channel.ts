@@ -2488,6 +2488,12 @@ export const xiotboxPlugin = {
             log,
           });
           const contextEpoch = conversationBinding?.contextEpoch ?? contextEpochResolution.epoch;
+          // XIOT-BUG-0118: the reply/identity AAD must match the dispatch
+          // AAD derivation — same preset segment, same canonical semantics.
+          const dispatchPermissionPreset =
+            typeof incoming?.permission_preset === 'string'
+              ? incoming.permission_preset.trim()
+              : '';
           const commandAad = e2e.buildAad({
             direction: 'c2p',
             device_id: finalCfg.DEVICE_ID,
@@ -2496,6 +2502,7 @@ export const xiotboxPlugin = {
             content_type: contentType,
             chunk_seq: 0,
             enc_v: Number(env?.enc_version ?? e2e.encV),
+            permission_preset: dispatchPermissionPreset,
           });
           let text = '';
           try {
@@ -2507,6 +2514,12 @@ export const xiotboxPlugin = {
               content_type: contentType,
               chunk_seq: 0,
               enc_v: Number(env?.enc_version ?? e2e.encV),
+              // XIOT-BUG-0118: the permission preset is part of the
+              // authenticated dispatch context, derived from THIS frame's
+              // payload field; a preset tampered, deleted or injected in
+              // flight fails AAD verification with its ciphertext.
+              // Absent/empty keeps the legacy byte-identical AAD.
+              permission_preset: dispatchPermissionPreset,
             });
           } catch (_err: any) {
             // Envelope unparseable/undecryptable or AAD mismatch: protocol
