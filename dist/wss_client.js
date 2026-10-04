@@ -321,6 +321,13 @@ class WSSClient extends EventEmitter {
                 // logs failures for observability only.
                 this.emit('SESSION.REGISTER_ACK', payload);
                 break;
+            case 'RUNTIMES.REQUEST':
+                // XIOT-BUG-0221: the gateway asks this Runtime to re-declare its
+                // registry. Without this case the frame falls through to the
+                // "Unknown message type" default and channel.ts never learns
+                // about it — the same two-layer trap as V2.APPROVAL_RESOLVE.
+                this.emit('RUNTIMES.REQUEST', payload);
+                break;
             case 'ERROR':
                 console.error('[WSS] Server error:', payload);
                 if (payload.code === 'REAUTH_REQUIRED') {
