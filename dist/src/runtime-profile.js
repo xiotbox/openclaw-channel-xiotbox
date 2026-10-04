@@ -118,7 +118,7 @@ export function buildOpenclawCapabilityDeclaration(options = {}) {
         conversation_rename: false,
         conversation_archive: true,
         conversation_fork: false,
-        workspace_context: false,
+        workspace_context: true,
         workspace_create: false,
         model_selection: modelSelection,
         model_catalog: OPENCLAW_MODEL_CATALOG_AVAILABLE,
@@ -153,10 +153,22 @@ export function buildOpenclawCapabilityDeclaration(options = {}) {
 }
 /**
  * Resource facts that ride NEXT TO the declaration on the RUNTIMES.LIST
- * runtime entry (never inside it): OpenClaw publishes no workspace seam and
- * no model catalog, so both lists are empty. Empty lists are resource facts
- * only — they must never be read as capability tri-states (0048a rule 4).
+ * runtime entry. The local path never leaves the Runtime. When OpenClaw's
+ * native persistent workspace exists, XiotBox publishes only its stable id,
+ * display name and access/execution facts.
  */
-export function buildOpenclawResourceFacts() {
-    return { workspaces: [], models: [] };
+export function buildOpenclawResourceFacts(workspaceAvailable = false) {
+    return {
+        workspaces: workspaceAvailable
+            ? [{
+                    workspace_id: 'workspace',
+                    name: 'OpenClaw Workspace',
+                    readable: true,
+                    writable: true,
+                    executable: true,
+                    execution_profiles: ['safe', 'full.workspace'],
+                }]
+            : [],
+        models: [],
+    };
 }

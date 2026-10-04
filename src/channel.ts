@@ -3491,6 +3491,28 @@ export const xiotboxPlugin = {
         }
       });
 
+      // XIOT-BUG-0221: the one and only Runtime Registry advertisement entry for
+      // this connection. Two triggers call it — a connected transport (first
+      // connect and every reconnect) and a gateway RUNTIMES.REQUEST — and they
+      // must never grow separate builders, or the declaration the control plane
+      // shows stops matching the one the runtime actually runs.
+      const advertiseRuntime = (): void => {
+        // Runtime visibility (XIOT-BUG-0007): publish the openclaw runtime so
+        // /v2/runtimes and orchestrator dispatch see this device as openclaw.
+        client.sendMessage('RUNTIMES.LIST', buildOpenclawRuntimeListPayload(finalCfg.DEVICE_ID, cfg));
+      };
+
+      client.on('RUNTIMES.REQUEST', (request: any) => {
+        // Provider-neutral "re-declare your registry". The acknowledgement only
+        // tells the gateway this adapter understood the frame; the RUNTIMES.LIST
+        // publication below is the proof of convergence.
+        const requestId = String(request?.request_id ?? '').trim();
+        if (requestId) {
+          client.sendMessage('RUNTIMES.REQUEST_ACK', { request_id: requestId, device_id: finalCfg.DEVICE_ID });
+        }
+        advertiseRuntime();
+      });
+
       client.on('connected', () => {
         log?.info?.(`[XiotBox][${accountId}] Connected to Gateway`);
         setConnectedAt(accountId, instanceId, Date.now());
@@ -3504,9 +3526,9 @@ export const xiotboxPlugin = {
         e2e.refreshPeerKey().catch((err: any) => {
           log?.warn?.(`[XiotBox][${accountId}] E2E peer key refresh failed: ${err?.message || err}`);
         });
-        // Runtime visibility (XIOT-BUG-0007): publish the openclaw runtime so
-        // /v2/runtimes and orchestrator dispatch see this device as openclaw.
-        client.sendMessage('RUNTIMES.LIST', buildOpenclawRuntimeListPayload(finalCfg.DEVICE_ID, cfg));
+        // Runtime visibility: advertise on every connection, so the cached
+        // registry belongs to the connection that is live now (XIOT-BUG-0221).
+        advertiseRuntime();
         // Re-register known conversation bindings after a reconnect; the
         // gateway upsert is idempotent and never clobbers client bindings.
         for (const [conversationId, known] of conversationBindingRegistry.entries()) {

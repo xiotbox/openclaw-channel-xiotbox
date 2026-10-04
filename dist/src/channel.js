@@ -15,6 +15,8 @@ import { registerActiveSubagentParent, registerSubagentLifecycleAccount, resolve
 import { registerActiveToolRun, setSessionPermission } from './tool-lifecycle.js';
 import { setSessionModelOverride } from './session-model.js';
 import { OPENCLAW_RUNTIME_KIND, buildOpenclawCapabilityDeclaration, buildOpenclawResourceFacts, } from './runtime-profile.js';
+import { executeWorkspaceControl } from './workspace-control.js';
+import { buildOpenclawWorkspaceRegistry, openclawWorkspaceAvailable, } from './runtime-workspace.js';
 import { getDirectSender, registerDirectSender } from './direct-send.js';
 import { clearConnectedAt, describeGatewayAccountState, getGatewayAccount, nextGatewayInstanceId, registerGatewayAccount, removeGatewayAccount, setConnectedAt, stopGatewayAccount, } from './gateway-state.js';
 import { buildConfig, buildSessionKey, CHANNEL_ID, getChannelConfig, listAccountIds, normalizeAccountId, normalizeAgentId, normalizeContextEpoch, normalizePositiveInt, normalizeStringValue, normalizeThreadId, resolveAccount, resolveAgentId, resolveDefaultAccountId, resolveConversationBinding, resolveEffectiveConfig, resolveThreadAgentId, } from './config.js';
@@ -295,7 +297,7 @@ export function buildOpenclawRuntimeId(deviceId) {
     const normalized = String(deviceId || '').trim();
     return normalized ? `openclaw-${normalized}` : '';
 }
-export function buildOpenclawRuntimeListPayload(deviceId) {
+export function buildOpenclawRuntimeListPayload(deviceId, cfg) {
     const normalized = String(deviceId || '').trim();
     const runtimeId = buildOpenclawRuntimeId(normalized);
     return {
@@ -309,7 +311,7 @@ export function buildOpenclawRuntimeListPayload(deviceId) {
                     status: 'online',
                     // Resource facts only (XIOT-PLAN-0008 §3.2 rule 4): empty lists
                     // mean "nothing published", never a capability tri-state.
-                    ...buildOpenclawResourceFacts(),
+                    ...buildOpenclawResourceFacts(openclawWorkspaceAvailable(cfg)),
                     // Explicit device capability declaration (XIOT-BUG-0050a),
                     // published under the exact `capabilities` key the Gateway 0048a
                     // contract reads (bot_ws._handle_runtimes_list →
@@ -1649,6 +1651,8 @@ export const xiotboxPlugin = {
             const accountId = normalizeAccountId(ctx?.accountId);
             const instanceId = nextGatewayInstanceId();
             const finalCfg = buildConfig(getChannelConfig(cfg));
+            const openclawRuntimeId = buildOpenclawRuntimeId(finalCfg.DEVICE_ID);
+            const workspaceRegistry = buildOpenclawWorkspaceRegistry(openclawRuntimeId, cfg);
             updateGatewayStatus(ctx, accountId, {
                 running: true,
                 connected: false,
@@ -1877,6 +1881,40 @@ export const xiotboxPlugin = {
                     deviceId: finalCfg.DEVICE_ID,
                 }, args);
             };
+            const handleWorkspaceCommand = async (args) => {
+                const cached = getCached(args.cmdId);
+                if (cached) {
+                    client.sendMessage(cached.type, cached.payload);
+                    return;
+                }
+                if (!commandLifecycle.ackAccepted(args.cmdId, args.traceId)) {
+                    commandLifecycle.replayLifecycleEvidence(args.cmdId);
+                    return;
+                }
+                commandLifecycle.markDelivered(args.cmdId);
+                try {
+                    const result = await executeWorkspaceControl(workspaceRegistry, args.commandType, args.incoming);
+                    const terminalPayload = {
+                        command_id: args.cmdId,
+                        status: 'success',
+                        trace_id: args.traceId,
+                        result,
+                    };
+                    client.sendMessage('COMMAND_RESULT', terminalPayload);
+                    setCached(args.cmdId, terminalPayload);
+                }
+                catch (err) {
+                    const terminalPayload = {
+                        command_id: args.cmdId,
+                        status: 'failed',
+                        trace_id: args.traceId,
+                        error: err instanceof Error ? err.message : String(err),
+                        result: err?.details && typeof err.details === 'object' ? { details: err.details } : {},
+                    };
+                    client.sendMessage('COMMAND_RESULT', terminalPayload);
+                    setCached(args.cmdId, terminalPayload);
+                }
+            };
             client.on('SESSION.ARCHIVE_ACK', (ackPayload) => {
                 settleSessionArchiveAck(ackPayload);
             });
@@ -1966,6 +2004,15 @@ export const xiotboxPlugin = {
                     const sessionCommandType = normalizeStringValue(payload?.command_type)
                         ?? normalizeStringValue(incoming?.command_type)
                         ?? '';
+                    if (sessionCommandType.startsWith('workspace.')) {
+                        await handleWorkspaceCommand({
+                            commandType: sessionCommandType,
+                            incoming,
+                            cmdId,
+                            traceId,
+                        });
+                        return;
+                    }
                     const sessionAction = resolveSessionCommandAction(sessionCommandType);
                     if (sessionAction !== 'chat') {
                         handleSessionCommand({
@@ -2037,6 +2084,11 @@ export const xiotboxPlugin = {
                         log,
                     });
                     const contextEpoch = conversationBinding?.contextEpoch ?? contextEpochResolution.epoch;
+                    // XIOT-BUG-0118: the reply/identity AAD must match the dispatch
+                    // AAD derivation — same preset segment, same canonical semantics.
+                    const dispatchPermissionPreset = typeof incoming?.permission_preset === 'string'
+                        ? incoming.permission_preset.trim()
+                        : '';
                     const commandAad = e2e.buildAad({
                         direction: 'c2p',
                         device_id: finalCfg.DEVICE_ID,
@@ -2045,6 +2097,7 @@ export const xiotboxPlugin = {
                         content_type: contentType,
                         chunk_seq: 0,
                         enc_v: Number(env?.enc_version ?? e2e.encV),
+                        permission_preset: dispatchPermissionPreset,
                     });
                     let text = '';
                     try {
@@ -2056,6 +2109,12 @@ export const xiotboxPlugin = {
                             content_type: contentType,
                             chunk_seq: 0,
                             enc_v: Number(env?.enc_version ?? e2e.encV),
+                            // XIOT-BUG-0118: the permission preset is part of the
+                            // authenticated dispatch context, derived from THIS frame's
+                            // payload field; a preset tampered, deleted or injected in
+                            // flight fails AAD verification with its ciphertext.
+                            // Absent/empty keeps the legacy byte-identical AAD.
+                            permission_preset: dispatchPermissionPreset,
                         });
                     }
                     catch (_err) {
@@ -2930,6 +2989,26 @@ export const xiotboxPlugin = {
                     // ignore
                 }
             });
+            // XIOT-BUG-0221: the one and only Runtime Registry advertisement entry for
+            // this connection. Two triggers call it — a connected transport (first
+            // connect and every reconnect) and a gateway RUNTIMES.REQUEST — and they
+            // must never grow separate builders, or the declaration the control plane
+            // shows stops matching the one the runtime actually runs.
+            const advertiseRuntime = () => {
+                // Runtime visibility (XIOT-BUG-0007): publish the openclaw runtime so
+                // /v2/runtimes and orchestrator dispatch see this device as openclaw.
+                client.sendMessage('RUNTIMES.LIST', buildOpenclawRuntimeListPayload(finalCfg.DEVICE_ID, cfg));
+            };
+            client.on('RUNTIMES.REQUEST', (request) => {
+                // Provider-neutral "re-declare your registry". The acknowledgement only
+                // tells the gateway this adapter understood the frame; the RUNTIMES.LIST
+                // publication below is the proof of convergence.
+                const requestId = String(request?.request_id ?? '').trim();
+                if (requestId) {
+                    client.sendMessage('RUNTIMES.REQUEST_ACK', { request_id: requestId, device_id: finalCfg.DEVICE_ID });
+                }
+                advertiseRuntime();
+            });
             client.on('connected', () => {
                 log?.info?.(`[XiotBox][${accountId}] Connected to Gateway`);
                 setConnectedAt(accountId, instanceId, Date.now());
@@ -2943,9 +3022,9 @@ export const xiotboxPlugin = {
                 e2e.refreshPeerKey().catch((err) => {
                     log?.warn?.(`[XiotBox][${accountId}] E2E peer key refresh failed: ${err?.message || err}`);
                 });
-                // Runtime visibility (XIOT-BUG-0007): publish the openclaw runtime so
-                // /v2/runtimes and orchestrator dispatch see this device as openclaw.
-                client.sendMessage('RUNTIMES.LIST', buildOpenclawRuntimeListPayload(finalCfg.DEVICE_ID));
+                // Runtime visibility: advertise on every connection, so the cached
+                // registry belongs to the connection that is live now (XIOT-BUG-0221).
+                advertiseRuntime();
                 // Re-register known conversation bindings after a reconnect; the
                 // gateway upsert is idempotent and never clobbers client bindings.
                 for (const [conversationId, known] of conversationBindingRegistry.entries()) {

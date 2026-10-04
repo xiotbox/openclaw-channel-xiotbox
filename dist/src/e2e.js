@@ -136,6 +136,23 @@ export function buildEnvelope(plaintext, receiverPubkey, keyId, aad, sessionId, 
     }
     return envelope;
 }
+function parseAuthenticatedAadVersion(aad) {
+    if (!aad?.length)
+        return null;
+    const match = /^oc\|v=(\d+)(?:\||$)/.exec(aad.toString('utf-8'));
+    if (!match)
+        return null;
+    const version = Number(match[1]);
+    return Number.isSafeInteger(version) ? version : null;
+}
+function aadCarriesPermissionPreset(aad) {
+    if (!aad?.length)
+        return false;
+    return aad
+        .toString('utf-8')
+        .split('|')
+        .some((segment) => segment.startsWith('preset='));
+}
 export function decryptEnvelope(envelope, privRaw, aad) {
     if (!envelope || envelope.magic !== E2E_MAGIC || envelope.version !== E2E_VERSION) {
         throw new Error('invalid_envelope');
@@ -158,16 +175,30 @@ export function decryptEnvelope(envelope, privRaw, aad) {
     const nonce = b64d(envelope.nonce_b64 || '');
     const ciphertext = b64d(envelope.ct_b64 || '');
     const envAad = envelope.aad_b64 ? b64d(envelope.aad_b64) : null;
-    // Prioritize envelope AAD (packetAAD) over provided AAD (localAAD)
-    // This fixes multi-device scenarios where device_id differs
+    // XIOT-BUG-0118: an unauthenticated envelope field must never decide
+    // whether an AAD mismatch is strict or lenient.  When packetAAD and the
+    // caller-derived canonical AAD disagree, first authenticate packetAAD by
+    // successfully opening the ciphertext with it.  Only then may its protocol
+    // grammar influence compatibility behavior.
     if (aad && envAad && !aad.equals(envAad)) {
-        // Log warning but don't throw - use envelope AAD
-        console.warn('[E2E] AAD mismatch, using envelope AAD', {
+        const plaintext = aesGcmDecrypt(contentKey, nonce, ciphertext, envAad);
+        const authenticatedVersion = parseAuthenticatedAadVersion(envAad);
+        const presetSemantics = aadCarriesPermissionPreset(envAad) || aadCarriesPermissionPreset(aad);
+        // v2 is strict based on the authenticated AAD itself, not enc_version.
+        // Preset-bearing semantics are always fail-closed so replacing, deleting
+        // or injecting permission_preset cannot be revived by downgrading,
+        // removing or corrupting the unauthenticated enc_version field.
+        if ((authenticatedVersion ?? 0) >= 2 || presetSemantics) {
+            throw new Error('e2e_aad_mismatch');
+        }
+        console.warn('[E2E] Legacy AAD mismatch, using authenticated packetAAD', {
             providedHash: aad.toString('hex').slice(0, 24),
             envelopeHash: envAad.toString('hex').slice(0, 24),
+            authenticatedVersion,
         });
+        return plaintext;
     }
-    const aadToUse = envAad || aad || null; // Prioritize envelope AAD
+    const aadToUse = envAad || aad || null;
     return aesGcmDecrypt(contentKey, nonce, ciphertext, aadToUse);
 }
 function resolveKeyPath(cfg, deviceId) {
@@ -731,6 +762,9 @@ export class OpenClawE2E {
             `type=${meta.content_type || ''}`,
             `seq=${meta.chunk_seq || 0}`,
         ];
+        const preset = String(meta.permission_preset ?? '').trim();
+        if (preset)
+            parts.push(`preset=${preset}`);
         return Buffer.from(`oc|${parts.join('|')}`, 'utf-8');
     }
     ensurePeerKey() {
@@ -888,40 +922,26 @@ export class OpenClawE2E {
     decryptText(envelope, meta) {
         if (!this.privRaw)
             throw new Error('missing_keypair');
-        // Read enc_version for controlled fallback
-        const encVersion = envelope.enc_version ?? 1;
-        // Priority 1: Try with packetAAD (envelope.aad_b64)
-        const envAad = envelope.aad_b64 ? b64d(envelope.aad_b64) : null;
-        if (envAad) {
-            try {
-                const raw = decryptEnvelope(envelope, this.privRaw, envAad);
-                return raw.toString('utf-8');
-            }
-            catch (err) {
-                console.warn('[E2E] Decrypt with packetAAD failed, trying localAAD', {
-                    error: err instanceof Error ? err.message : String(err),
-                });
-            }
-        }
-        // Priority 2: Fallback to localAAD (canonical)
+        // Canonical AAD comes from THIS dispatch frame. decryptEnvelope owns the
+        // only packetAAD compatibility decision and bases strictness on AAD that
+        // has actually authenticated the ciphertext, never on enc_version.
         const localAad = this.buildAad(meta);
         try {
             const raw = decryptEnvelope(envelope, this.privRaw, localAad);
             return raw.toString('utf-8');
         }
         catch (err) {
-            // Priority 3: Legacy fallbacks (only for v0/v1)
-            if (encVersion < 2) {
-                console.warn('[E2E] Canonical localAAD failed, trying legacy fallbacks (enc_v < 2)');
-                // Try with empty AAD for v0
-                if (encVersion === 0) {
-                    try {
-                        const raw = decryptEnvelope(envelope, this.privRaw, null);
-                        return raw.toString('utf-8');
-                    }
-                    catch (legacyErr) {
-                        // Fall through to throw original error
-                    }
+            // Legacy v0 envelopes may have been sealed with no AAD at all. Only
+            // attempt that compatibility path when no packetAAD is present. A v2
+            // envelope whose aad_b64 was stripped still cannot pass this retry,
+            // because its GCM tag was created with non-empty AAD.
+            if (!envelope.aad_b64) {
+                try {
+                    const raw = decryptEnvelope(envelope, this.privRaw, null);
+                    return raw.toString('utf-8');
+                }
+                catch (_legacyErr) {
+                    // Preserve the canonical failure below.
                 }
             }
             throw err;
